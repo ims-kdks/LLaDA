@@ -1,6 +1,9 @@
 import torch
 import numpy as np
 import torch.nn.functional as F
+from tqdm import trange
+from model.modeling_llada import LLaDAModelLM
+from model import modeling_llada
 
 from transformers import AutoTokenizer, AutoModel
 
@@ -41,7 +44,7 @@ def get_num_transfer_tokens(mask_index, steps):
 
 
 @ torch.no_grad()
-def generate(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
+def generate(model: LLaDAModelLM, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
              cfg_scale=0., remasking='low_confidence', mask_id=126336):
     '''
     Args:
@@ -64,12 +67,13 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
     num_blocks = gen_length // block_length
 
     assert steps % num_blocks == 0
+    modeling_llada.outline_stage_threshold = steps // 2
     steps = steps // num_blocks
 
-    for num_block in range(num_blocks):
+    for num_block in trange(num_blocks):
         block_mask_index = (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length:] == mask_id)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
-        for i in range(steps):
+        for i in trange(steps):
             mask_index = (x == mask_id)
             if cfg_scale > 0.:
                 un_x = x.clone()
@@ -79,7 +83,7 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
                 logits, un_logits = torch.chunk(logits, 2, dim=0)
                 logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
             else:
-                logits = model(x).logits
+                logits = model(x, time_step = num_block * block_length + i).logits
 
             logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
             x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
@@ -110,10 +114,10 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
 def main():
     device = 'cuda'
 
-    model = AutoModel.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True, torch_dtype=torch.bfloat16).to(device).eval()
+    model = LLaDAModelLM.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True, torch_dtype=torch.bfloat16).to(device).eval()
     tokenizer = AutoTokenizer.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True)
 
-    prompt = "Lily can run 12 kilometers per hour for 4 hours. After that, she runs 6 kilometers per hour. How many kilometers can she run in 8 hours?"
+    prompt = "Lily can run 12 kilometers per hour for 4 hours. After that, she runs 6 kilometers per hour. How many kilometers can she run in 7 hours?"
 
     # Add special tokens for the Instruct model. The Base model does not require the following two lines.
     m = [{"role": "user", "content": prompt}, ]
@@ -123,8 +127,19 @@ def main():
     input_ids = torch.tensor(input_ids).to(device).unsqueeze(0)
 
     out = generate(model, input_ids, steps=128, gen_length=128, block_length=32, temperature=0., cfg_scale=0., remasking='low_confidence')
-    print(tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)[0])
-
+    print(tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True))
+    # for layer_id in range(model.config.n_layers):
+    #     modeling_llada.layer_id = layer_id
+    #     modeling_llada.layer_outputs = []
+    #     # generation
+    #     import matplotlib.pyplot as plt
+    #     layer_outputs = torch.stack(modeling_llada.layer_outputs)
+    #     norm = torch.nn.functional.normalize(layer_outputs, dim=-1)
+    #     product = torch.einsum('ibtd,jbtd->ijbt', norm, norm)
+    #     mean_sim = product.mean(dim=(2,3))
+    #     plt.imshow(mean_sim.float().to('cpu').numpy())
+    #     plt.savefig(f'experiments/layer{modeling_llada.layer_id}_similarity_{128}.png')
+    #     plt.close()
 
 if __name__ == '__main__':
     main()
